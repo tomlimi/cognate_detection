@@ -73,7 +73,7 @@ class ClassificationDataset:
         out_representation = [list(row) for row in out_representation]
         return out_representation, compression_model
 
-    def get_representation(self, dataset_split, fields, models_names, compress_components=None, compression_model=None):
+    def get_representation(self, dataset_split, fields, models_names, compress_components=None, compression_models=None):
         """
         :param dataset: dataset to get the representation from
         :param fields: fields of dataset to get the representation
@@ -88,6 +88,9 @@ class ClassificationDataset:
         #             ft_models[lang] = ft_models[fasttext_mapping.get(lang, 'en')]
         #         else:
         #             ft_models[lang] = model
+        
+        if compression_models is None:
+            compression_models = {models_name : None for models_name in models_names}
     
         for idx, field in enumerate(fields):
             for model_name in models_names:
@@ -108,13 +111,13 @@ class ClassificationDataset:
                                 return_tensors='pt', padding=True, truncation=True, add_special_tokens=True)
                 )[0].mean(1)}, batched=True)
 
-                if compression_model is not None:
+                if compression_models[model_name] is not None:
                     compressed_representation, _ = self.compress_representation(self.dataset[dataset_split][f"{model_name}_{field}"],
                                                                                 compress_components=compress_components,
-                                                                                compression_model=compression_model)
+                                                                                compression_model=compression_models[model_name])
 
                 elif compress_components is not None:
-                    compressed_representation, compression_model = self.compress_representation(
+                    compressed_representation, compression_models[model_name]= self.compress_representation(
                         self.dataset[dataset_split][f"{model_name}_{field}"], compress_components=compress_components)
 
                 else:
@@ -124,7 +127,7 @@ class ClassificationDataset:
                 self.dataset[dataset_split]  = self.dataset[dataset_split].remove_columns(
                     [f"{model_name}_{field}"]).add_column(f"{model_name}_{field}", compressed_representation)
     
-        return compression_model
+        return compression_models
 
     @property
     def train(self):

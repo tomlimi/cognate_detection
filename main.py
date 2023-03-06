@@ -154,9 +154,9 @@ def main(models, truncate_at, compress_components, datata_dir, output_dir, seed)
     dataset = ClassificationDataset(data_dir=datata_dir, truncate_at=truncate_at, dev_split=0.1)
     
     logging.info(f"Getting embeddings for train split from: {models}, dimensionality reduced to {compress_components}")
-    compression_model = dataset.get_representation('train', ['word1', 'word2'], models, compress_components=compress_components)
-    dataset.get_representation('validation', ['word1', 'word2'], models, compress_components=compress_components, compression_model=compression_model)
-    dataset.get_representation('test', ['word1', 'word2'], models, compress_components=compress_components, compression_model=compression_model)
+    compression_models = dataset.get_representation('train', ['word1', 'word2'], models, compress_components=compress_components)
+    dataset.get_representation('validation', ['word1', 'word2'], models, compress_components=compress_components, compression_models=compression_models)
+    dataset.get_representation('test', ['word1', 'word2'], models, compress_components=compress_components, compression_models=compression_models)
     
     embedding_fields = [f"{model}_{field}" for model in models for field in ['word1', 'word2']]
     test_prediction, test_probs, classifier, results = run_xgboost(dataset, embedding_fields, seed)
