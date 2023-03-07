@@ -7,6 +7,7 @@ import sys
 
 from data_wrapper import ClassificationDataset
 from sklearn.metrics import accuracy_score, confusion_matrix
+from sklearn.utils import class_weight
 
 import xgboost as xgb
 import numpy as np
@@ -20,6 +21,17 @@ LANGUAGES = ['en', 'fr', 'de', 'da', 'el', 'it', 'no', 'nl', 'af', 'br', 'ca', '
              'kw', 'la', 'lb', 'lt', 'lv', 'nb', 'nl', 'nn', 'no', 'oc', 'pl', 'pt', 'ro', 'sk', 'sl', 'sv', 'wa']
 
 CLASSES = ['der', 'cog', 'none']
+
+FAMILIES = ['germanic', 'romance', 'hellenic', 'celtic', 'slavic', 'baltic']
+
+# latin is not romance in theory but italic
+language2family_mapping = {'en': 'germanic', 'fr': 'romance', 'de': 'germanic', 'da': 'germanic', 'el': 'hellenic',
+                           'it': 'romance','no': 'germanic', 'nl': 'germanic', 'af': 'germanic', 'br': 'celtic',
+                           'ca': 'romance', 'cs': 'slavic', 'cy': 'hellenic', 'es': 'romance', 'fy': 'germanic',
+                           'ga': 'celtic', 'gd': 'celtic', 'gl': 'romance', 'gv': 'celtic', 'is': 'germanic',
+                           'kw': 'celtic', 'la': 'romance', 'lb': 'germanic', 'lt': 'baltic', 'lv': 'baltic',
+                           'nb': 'germanic', 'nn': 'germanic', 'oc': 'romance', 'pl': 'slavic', 'pt': 'romance',
+                           'ro': 'romance', 'sk': 'slavic', 'sl': 'slavic', 'sv': 'germanic', 'wa': 'romance'}
 
 fasttext_mapping = {'br': 'fr', 'cy': 'el', 'fy': 'nl', 'ga': 'en', 'gd': 'en', 'gv': 'en', 'is': 'da', 'kw': 'en',
                     'la': 'it', 'lb': 'de', 'nb': 'no', 'nn': 'na', 'oc': 'fr', 'wa': 'fr'}
@@ -47,12 +59,22 @@ def hf_dataset_to_arrays(dataset, embedding_fields, target_field='class'):
     
     for lang_field in ('lang1', 'lang2'):
         lang_index = np.array([LANGUAGES.index(x) for x in dataset[lang_field]])
-        # encoding languages in one-hot representation
-        one_hot_lf = np.zeros((len(lang_index), len(LANGUAGES)))
-        one_hot_lf[np.arange(len(lang_index)), lang_index] = 1
-        one_hot_lf = one_hot_lf[:, 1:]
         
-        X = np.concatenate((X, one_hot_lf[:, 1:]), axis=1)
+        # encoding languages in one-hot representation
+        one_hot_lang = np.zeros((len(lang_index), len(LANGUAGES)))
+        one_hot_lang[np.arange(len(lang_index)), lang_index] = 1
+        # first column can be inferred from the other columns
+        one_hot_lang = one_hot_lang[:, 1:]
+        
+        X = np.concatenate((X, one_hot_lang), axis=1)
+
+        lang_family_index = np.array([FAMILIES.index(language2family_mapping[x]) for x in dataset[lang_field]])
+        # encoding language families in one-hot representation
+        one_hot_family = np.zeros((len(lang_family_index), len(FAMILIES)))
+        one_hot_family[np.arange(len(lang_family_index)), lang_family_index] = 1
+        one_hot_family = one_hot_family[:, 1:]
+        
+        X = np.concatenate((X, one_hot_family), axis=1)
 
     if target_field is not None:
         y = np.array([CLASSES.index(x) for x in dataset[target_field]]).reshape(-1, 1)
@@ -62,15 +84,39 @@ def hf_dataset_to_arrays(dataset, embedding_fields, target_field='class'):
     return X, y
 
 
-def train_xgboost(dataset_split, embedding_fields, target_field='class', seed=1234):
+def train_xgboost(dataset_split, embedding_fields, target_field='class', weighting=True, seed=1234):
     
     X, y = hf_dataset_to_arrays(dataset_split, embedding_fields, target_field)
-    clf = xgb.XGBClassifier(base_score=0.5, colsample_bylevel=1, colsample_bytree=1,
-                            gamma=0, learning_rate=0.1, max_delta_step=1, max_depth=6,
-                            min_child_weight=1, missing=2, n_estimators=100, nthread=-1,
-                            objective='multi:softprob', reg_alpha=0, reg_lambda=1,
-                            scale_pos_weight=1, seed=seed, silent=False, subsample=1)
+    
+    xgboost_params = {
+        'objective': 'multi:softprob',
+        'missing': 2,
+        'base_score': 0.5,
+        'colsample_bylevel': 1,
+        'colsample_bytree': 1,
+        'gamma': 0,
+        'learning_rate': 0.1,
+        'max_delta_step': 1,
+        'max_depth': 6,
+        'min_child_weight': 1,
+        'n_estimators': 100,
+        'nthread': -1,
+        'reg_alpha': 0,
+        'reg_lambda': 1,
+        'scale_pos_weight': 1,
+        'subsample': 1,
+        'verbosity': 2,
+        'seed': seed}
+    
+    if weighting:
+        sample_weights = class_weight.compute_sample_weight('balanced', y)
+        xgboost_params['sample_weight'] = sample_weights
+        logging.info(f"Using sample weights: {sample_weights}")
+    
+    clf = xgb.XGBClassifier(**xgboost_params)
+
     clf.fit(X, y)
+
     return clf
 
 
@@ -89,11 +135,14 @@ def infer_eval_xgboost(dataset_split, classifier, embedding_fields, target_field
     return y_pred_decoded, y_pred_probs, acc
 
 
-def save_predictions_and_model(classifier, predictions, probabilities, results, output_dir, models, truncate_at, compress_components, seed):
+def save_predictions_and_model(classifier, predictions, probabilities, results, output_dir, models, truncate_at, compress_components, weighting, seed):
     
     output_path = os.path.join(output_dir, f"models_{'_'.join(models).replace('/','-')}_cc_{compress_components}_seed_{seed}")
     if truncate_at > 0:
         output_path+= f"_truncate_{truncate_at}"
+    output_path += "_family"
+    if weighting:
+        output_path += "_weighted"
 
     output_directory = os.path.join(output_dir, output_path)
     os.makedirs(output_directory, exist_ok=True)
@@ -120,11 +169,11 @@ def save_predictions_and_model(classifier, predictions, probabilities, results, 
         log_file.writelines(cur_running)
     
     
-def run_xgboost(dataset, embedding_fields, seed):
+def run_xgboost(dataset, embedding_fields, weighting, seed):
     results = {'train': {}, 'validation': {}}  # store the results for each split
     
     logging.info(f"Training on {len(dataset.train)} samples")
-    classifier = train_xgboost(dataset.train, embedding_fields, seed=seed)
+    classifier = train_xgboost(dataset.train, embedding_fields, weighting=weighting, seed=seed)
     y_pred_train, _, acc_train = infer_eval_xgboost(dataset.train, classifier, embedding_fields)
     logging.info(f"Confusion matrix, labels are: {CLASSES}, rows are true, columns are predicted")
     train_cm = confusion_matrix(dataset.train['class'], y_pred_train, labels=CLASSES)
@@ -147,21 +196,27 @@ def run_xgboost(dataset, embedding_fields, seed):
     return y_pred_test, y_pred_probs_test, classifier, results
 
 
-def main(models, truncate_at, compress_components, datata_dir, output_dir, seed):
+def main(models, truncate_at, compress_components, data_dir, output_dir, seed):
     # models = ['google/canine-c']  # ['fasttext', 'facebook-xlm-v-base']
     # truncate_at = 500
     # compress_components = 16
-    dataset = ClassificationDataset(data_dir=datata_dir, truncate_at=truncate_at, dev_split=0.1)
+    weighting = True
+    hf_cache = f"cached_models_{'_'.join(models).replace('/','-')}"
+    dataset = ClassificationDataset(data_dir=data_dir, hf_cache=hf_cache, truncate_at=truncate_at, dev_split=0.1, seed=seed)
     
-    logging.info(f"Getting embeddings for train split from: {models}, dimensionality reduced to {compress_components}")
-    compression_models = dataset.get_representation('train', ['word1', 'word2'], models, compress_components=compress_components)
-    dataset.get_representation('validation', ['word1', 'word2'], models, compress_components=compress_components, compression_models=compression_models)
-    dataset.get_representation('test', ['word1', 'word2'], models, compress_components=compress_components, compression_models=compression_models)
-    
+    if not dataset.loaded_from_cache:
+        logging.info(f"Getting embeddings for train split from: {models}, dimensionality reduced to {compress_components}")
+        compression_models = dataset.get_representation('train', ['word1', 'word2'], models, compress_components=compress_components)
+        dataset.get_representation('validation', ['word1', 'word2'], models, compress_components=compress_components, compression_models=compression_models)
+        dataset.get_representation('test', ['word1', 'word2'], models, compress_components=compress_components, compression_models=compression_models)
+        dataset.save_hf_cache(os.path.join(data_dir, hf_cache))
+    else:
+        logging.info(f"Loaded dataset from cache: {hf_cache}")
+        
     embedding_fields = [f"{model}_{field}" for model in models for field in ['word1', 'word2']]
-    test_prediction, test_probs, classifier, results = run_xgboost(dataset, embedding_fields, seed)
+    test_prediction, test_probs, classifier, results = run_xgboost(dataset, embedding_fields, weighting, seed)
     save_predictions_and_model(classifier, test_prediction, test_probs, results, output_dir,
-                               models, truncate_at, compress_components, seed)
+                               models, truncate_at, compress_components, weighting,  seed)
     
     
 # Press the green button in the gutter to run the script.
@@ -179,4 +234,3 @@ if __name__ == '__main__':
     random.seed(args.seed)
     main(args.models, args.truncate_at, args.compress_components, args.data_dir, args.output_dir, args.seed)
     
-

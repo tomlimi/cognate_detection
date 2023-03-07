@@ -13,32 +13,32 @@ class ClassificationDataset:
     NUM_CLASSES = 3
     random.seed(42)
     
-    def __init__(self, data_dir=None, truncate_at=-1, dev_split=0.):
+    def __init__(self, data_dir, hf_cache=None,  truncate_at=-1, dev_split=0., seed=1234):
+        
+        self.seed = seed
+        
         self.data_dir = data_dir
         self.dev_split = dev_split
         
         self.truncate_at = truncate_at
         self.dataset = {}
-        self.load_dataset()
         
-    @staticmethod
-    def read_csv(file_name):
-        with open(file_name, 'r') as fp:
-            for line in fp:
-                split_line = list(line.strip().split(','))
+        self.loaded_from_cache = False
         
-                if len(split_line) == 4:
-                    split_line.append(None)
-                yield dict(zip(['word1', 'lang1', 'word2', 'lang2', 'class'], split_line))
-                
-    def load_dataset(self):
+        if hf_cache is not None and os.path.exists(os.path.join(data_dir, hf_cache)):
+            self.load_hf_cache(os.path.join(data_dir, hf_cache))
+            self.loaded_from_cache = True
+        else:
+            self.load_csv()
+            
+    def load_csv(self):
         
         train_data = pd.read_csv(os.path.join(self.data_dir, 'train.csv'),
                                  names=['word1', 'lang1', 'word2', 'lang2', 'class'], na_filter=False)
         train_data = Dataset.from_pandas(train_data)
         
         if self.truncate_at > 0:
-            train_data = train_data.shuffle().select(range(self.truncate_at))
+            train_data = train_data.shuffle(seed=self.seed).select(range(self.truncate_at))
             
         if self.dev_split > 0:
             # split dataset into train and dev
@@ -56,6 +56,14 @@ class ClassificationDataset:
         
         self.dataset['test'] = test_data
 
+    def load_hf_cache(self, hf_cache_path):
+        for dataset_split in ['train', 'validation', 'test']:
+            self.dataset[dataset_split] = Dataset.load_from_disk(os.path.join(hf_cache_path, dataset_split))
+        
+    def save_hf_cache(self, hf_cache_path):
+        for dataset_split in ['train', 'validation', 'test']:
+            self.dataset[dataset_split].save_to_disk(os.path.join(hf_cache_path, dataset_split))
+        
     @staticmethod
     def compress_representation(in_representation, compress_components=8, compression_model=None):
 
