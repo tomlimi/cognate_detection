@@ -36,23 +36,13 @@ language2family_mapping = {'en': 'germanic', 'fr': 'romance', 'de': 'germanic', 
                            'nb': 'germanic', 'nn': 'germanic', 'oc': 'romance', 'pl': 'slavic', 'pt': 'romance',
                            'ro': 'romance', 'sk': 'slavic', 'sl': 'slavic', 'sv': 'germanic', 'wa': 'romance'}
 
-fasttext_mapping = {'br': 'fr', 'cy': 'el', 'fy': 'nl', 'ga': 'en', 'gd': 'en', 'gv': 'en', 'is': 'da', 'kw': 'en',
-                    'la': 'it', 'lb': 'de', 'nb': 'no', 'nn': 'na', 'oc': 'fr', 'wa': 'fr'}
 
-    
-def load_fasttext_model(language):
-    # correctly load fasttext vectors
-    if os.path.exists(f"data/fasttext/wiki.{language}.align.vec"):
-        return KeyedVectors.load_word2vec_format(f"data/fasttext/wiki.{language}.align.vec")
-    else:
-        return None
-
-
-def hf_dataset_to_arrays(dataset, embedding_fields, target_field='class'):
+def hf_dataset_to_arrays(dataset, embedding_fields, capitalized=True, target_field='class'):
     """
     
     :param dataset:
     :param embedding_fields:
+    :param capitalized:
     :param target_field:
     :param class_encoder: 'onehot' or 'label' defines how to encode the class
     :return: X, y array of features and labels for XGBoost
@@ -60,6 +50,9 @@ def hf_dataset_to_arrays(dataset, embedding_fields, target_field='class'):
     # convert the dataset to numpy arrays
     X = np.concatenate([dataset[x] for x in embedding_fields], axis=1)
     
+    if capitalized:
+        for lang_field in ('word1', 'word2'):
+            X = np.concatenate((X, np.array([int(x[0].isupper()) for x in dataset[lang_field]]).reshape(-1, 1)), axis=1)
     for lang_field in ('lang1', 'lang2'):
         lang_index = np.array([LANGUAGES.index(x) for x in dataset[lang_field]])
         
@@ -100,7 +93,7 @@ def objective(space, X_train, X_test, y_train, y_test, sample_weights=None):
     return {'loss': 1 - f1, 'status': STATUS_OK}
 
 
-def hyperparam_optimization(X, y,weighting, **params):
+def hyperparam_optimization(X, y,weighting, max_evals=100, **params):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.3, random_state=0)
     if weighting:
         sample_weights = class_weight.compute_sample_weight('balanced', y_train)
@@ -114,7 +107,10 @@ def hyperparam_optimization(X, y,weighting, **params):
         'eta': hp.uniform('eta', 0.01, 0.3),
         'colsample_bylevel': hp.uniform('colsample_bylevel', 0.6, 1),
         'colsample_bytree': hp.uniform('colsample_bytree', 0.6, 1),
-        'subsample': hp.uniform('subsample', 0.6, 1)
+        'colsample_bynode': hp.uniform('colsample_bynode', 0.6, 1),
+        'subsample': hp.uniform('subsample', 0.6, 1),
+        'lambda': hp.uniform('lambda', 0, 5),
+        'alpha': hp.uniform('alpha', 0, 5)
     }
     
     params = {param: params[param] for param in params if param in space}
@@ -126,7 +122,7 @@ def hyperparam_optimization(X, y,weighting, **params):
     best = fmin(fn=fmin_objective,
                 space=params,
                 algo=tpe.suggest,
-                max_evals=100,
+                max_evals=max_evals,
                 trials=trials)
     
     logging.info(f"Best hyperparameters: {best}")
@@ -134,9 +130,9 @@ def hyperparam_optimization(X, y,weighting, **params):
     return best
     
 
-def train_xgboost(dataset_split, embedding_fields, target_field='class', weighting=True, hyperparam_optimize = True, seed=1234):
+def train_xgboost(dataset_split, embedding_fields, target_field='class', max_evals=100, capitalized=True, weighting=True, hyperparam_optimize = True, seed=1234):
     
-    X, y = hf_dataset_to_arrays(dataset_split, embedding_fields, target_field)
+    X, y = hf_dataset_to_arrays(dataset_split, embedding_fields,capitalized, target_field)
     
     general_params = {
         'booster': 'gbtree',
@@ -146,15 +142,17 @@ def train_xgboost(dataset_split, embedding_fields, target_field='class', weighti
     }
 
     # to tune: max_depth 3 - 10, min_child_weight 1 - 6, gamma 0 - 0.3, eta 0.01 - 0.3, colsample_bylevel 0.6 - 1
+    # parameters chosen based on bayesian tuning
     
     booster_params = {
-        'eta': 0.1,
-        'max_depth': 6,
-        'min_child_weight': 1,
+        'eta': 0.19,
+        'gamma': 1.27,
+        'max_depth': 17,
+        'min_child_weight': 6,
         'max_delta_step': 5,
-        'subsample': 0.7,
-        'colsample_bytree': 1.0,
-        'colsample_bylevel': 0.7,
+        'subsample': 0.82,
+        'colsample_bytree': 0.92,
+        'colsample_bylevel': 0.97,
         'colsample_bynode': 1.0,
         'lambda': 1.0,
         'alpha': 0.0,
@@ -167,11 +165,9 @@ def train_xgboost(dataset_split, embedding_fields, target_field='class', weighti
         'eval_metric': 'aucpr',
         'seed': seed
     }
-    
-
         
     if hyperparam_optimize:
-        final_params = hyperparam_optimization(X, y, weighting, **general_params, **booster_params, **task_params)
+        final_params = hyperparam_optimization(X, y, weighting, max_evals=max_evals, **general_params, **booster_params, **task_params)
         final_params['max_depth'] = int(final_params['max_depth'])
         final_params['min_child_weight'] = int(final_params['min_child_weight'])
     else:
@@ -192,9 +188,9 @@ def train_xgboost(dataset_split, embedding_fields, target_field='class', weighti
     return clf
 
 
-def infer_eval_xgboost(dataset_split, classifier, embedding_fields, target_field='class'):
+def infer_eval_xgboost(dataset_split, classifier, embedding_fields, capitalized, target_field='class'):
     
-    X, y = hf_dataset_to_arrays(dataset_split, embedding_fields, target_field)
+    X, y = hf_dataset_to_arrays(dataset_split, embedding_fields, capitalized, target_field)
     y_pred_probs = classifier.predict_proba(X)
     y_pred = np.argmax(y_pred_probs, axis=1)
     if target_field is not None:
@@ -211,7 +207,7 @@ def infer_eval_xgboost(dataset_split, classifier, embedding_fields, target_field
 
 
 def save_predictions_and_model(classifier,results, validation_tes, test_tes, output_dir, models, truncate_at,
-                               compress_components, weighting, hyperparam_optimize, seed):
+                               compress_components, weighting, hyperparam_optimize, capitalized, max_evals, seed):
     
     output_path = os.path.join(output_dir, f"models_{'_'.join(models).replace('/','-')}_cc_{compress_components}_seed_{seed}")
     if truncate_at > 0:
@@ -220,7 +216,9 @@ def save_predictions_and_model(classifier,results, validation_tes, test_tes, out
     if weighting:
         output_path += "_weighted"
     if hyperparam_optimize:
-        output_path += "_hyperopt"
+        output_path += f"_hyperopt_me_{max_evals}"
+    if capitalized:
+        output_path += "_capitalized"
 
     output_directory = os.path.join(output_dir, output_path)
     os.makedirs(output_directory, exist_ok=True)
@@ -240,7 +238,7 @@ def save_predictions_and_model(classifier,results, validation_tes, test_tes, out
     # save the model
     classifier.save_model(os.path.join(output_directory, 'model.json'))
     
-    results_pruned = {k: {k2: v2 for k2, v2 in v.items() if k2 in {'cm', 'acc'}} for k, v in results.items()}
+    results_pruned = {k: {k2: v2 for k2, v2 in v.items() if k2 in {'cm', 'acc', 'f1'}} for k, v in results.items()}
     # save the results
     with open(os.path.join(output_directory, 'results.json'), 'w') as f:
         json.dump(results_pruned, f)
@@ -252,14 +250,14 @@ def save_predictions_and_model(classifier,results, validation_tes, test_tes, out
         log_file.writelines(cur_running)
     
     
-def run_xgboost(dataset, embedding_fields, weighting, hyperparam_optimize, seed):
+def run_xgboost(dataset, embedding_fields, weighting, hyperparam_optimize, capitalized, max_evals, seed):
     
     results = {'train': {}, 'validation': {}, 'test': {}}  # store the results for each split
     
     logging.info(f"Training on {len(dataset.train)} samples")
-    classifier = train_xgboost(dataset.train, embedding_fields,
+    classifier = train_xgboost(dataset.train, embedding_fields, max_evals=max_evals, capitalized=capitalized,
                                weighting=weighting, hyperparam_optimize=hyperparam_optimize, seed=seed)
-    y_pred_train, y_pred_probs_train, acc_train, f1_train = infer_eval_xgboost(dataset.train, classifier, embedding_fields)
+    y_pred_train, y_pred_probs_train, acc_train, f1_train = infer_eval_xgboost(dataset.train, classifier, embedding_fields, capitalized=capitalized)
     logging.info(f"Confusion matrix, labels are: {CLASSES}, rows are true, columns are predicted")
     train_cm = confusion_matrix(dataset.train['class'], y_pred_train, labels=CLASSES)
     logging.info(f"\n{train_cm}")
@@ -271,7 +269,7 @@ def run_xgboost(dataset, embedding_fields, weighting, hyperparam_optimize, seed)
     results['train']['probabilities'] = y_pred_probs_train
     
     logging.info(f"Evaluating on {len(dataset.validation)} samples:")
-    y_pred_val, y_pred_probs_val, acc_val, f1_val = infer_eval_xgboost(dataset.validation, classifier, embedding_fields)
+    y_pred_val, y_pred_probs_val, acc_val, f1_val = infer_eval_xgboost(dataset.validation, classifier, embedding_fields, capitalized=capitalized)
     logging.info(f"Confusion matrix:")
     val_cm = confusion_matrix(dataset.validation['class'], y_pred_val, labels=CLASSES)
     logging.info(f"\n {val_cm}")
@@ -282,7 +280,7 @@ def run_xgboost(dataset, embedding_fields, weighting, hyperparam_optimize, seed)
     results['validation']['probabilities'] = y_pred_val
     
     logging.info(f"Predicting for evaluation split:")
-    y_pred_test, y_pred_probs_test, _, _ = infer_eval_xgboost(dataset.test, classifier, embedding_fields, target_field=None)
+    y_pred_test, y_pred_probs_test, _, _ = infer_eval_xgboost(dataset.test, classifier, embedding_fields, capitalized=capitalized, target_field=None)
     results['test']['predictions'] = y_pred_test
     results['test']['probabilities'] = y_pred_probs_test
     
@@ -290,11 +288,13 @@ def run_xgboost(dataset, embedding_fields, weighting, hyperparam_optimize, seed)
 
 
 def main(models, truncate_at, compress_components, data_dir, output_dir, seed):
-    # models = ['google/canine-c']  # ['fasttext', 'facebook-xlm-v-base']
-    # truncate_at = 500
-    # compress_components = 16
+
+    # TODO add those hardcoded parameters to argparse
     weighting = True
     hyperparam_optimize = True
+    capitalized = True
+    max_evals = 50
+    
     hf_cache = f"cached_models_{'_'.join(models).replace('/','-')}"
     dataset = ClassificationDataset(data_dir=data_dir, hf_cache=hf_cache, truncate_at=truncate_at, dev_split=0.1, seed=seed)
     
@@ -311,9 +311,9 @@ def main(models, truncate_at, compress_components, data_dir, output_dir, seed):
     validation_tes = [','.join([te['word1'], te['lang1'], te['word2'], te['lang2'], te['class']]) for te in dataset.validation]
     test_tes = [','.join([te['word1'], te['lang1'], te['word2'], te['lang2']]) for te in dataset.test]
     
-    classifier, results = run_xgboost(dataset, embedding_fields, weighting, hyperparam_optimize, seed)
+    classifier, results = run_xgboost(dataset, embedding_fields, weighting, hyperparam_optimize,capitalized, max_evals, seed)
     save_predictions_and_model(classifier, results, validation_tes, test_tes, output_dir,
-                               models, truncate_at, compress_components, weighting, hyperparam_optimize,  seed)
+                               models, truncate_at, compress_components, weighting, hyperparam_optimize, capitalized, max_evals,  seed)
     
     
 # Press the green button in the gutter to run the script.
